@@ -6,7 +6,7 @@ on:
 
 jobs:
   copy-fork:
-    if: |
+    if: >
       github.event.issue.pull_request &&
       contains(github.event.comment.body, 'sync')
     runs-on: ubuntu-latest
@@ -15,7 +15,7 @@ jobs:
       pull-requests: write
 
     steps:
-      - name: Check if commenting user has write access
+      - name: Check write access
         id: access
         uses: actions/github-script@v7
         with:
@@ -25,49 +25,70 @@ jobs:
               repo: context.repo.repo,
               username: context.payload.comment.user.login
             });
-            if (perm.permission === 'admin' || perm.permission === 'write') {
-              return true;
-            } else {
-              // Post a comment about invalid access
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body: `Sorry @${context.payload.comment.user.login}, you do not have write access to perform this action.`
-              });
-              return false;
-            }
+            if (perm.permission === 'admin' || perm.permission === 'write') return true;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `Sorry @${context.payload.comment.user.login}, you do not have write access to perform this action.`
+            });
+            return false;
 
       - name: Stop if no write access
         if: steps.access.outputs.result != 'true'
         run: exit 0
 
-      - name: Checkout target repository
+      - name: Generate branch name
+        id: gen-branch
+        run: echo "branch-name=sync-fork-branch-$(date +%Y%m%d%H%M%S)" >> $GITHUB_OUTPUT
+
+      - name: Checkout base branch
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.base.ref }}
           fetch-depth: 0
 
+      - name: Create sync branch
+        run: git checkout -b ${{ steps.gen-branch.outputs.branch-name }}
+
+      - name: Get PR head info
+        id: get-head
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number
+            });
+            core.setOutput('headRepo', pr.data.head.repo.full_name);
+            core.setOutput('headRef', pr.data.head.ref);
+
       - name: Checkout fork code
         uses: actions/checkout@v4
         with:
+          repository: ${{ steps.get-head.outputs.headRepo }}
+          ref: ${{ steps.get-head.outputs.headRef }}
           path: fork
 
-      - name: Copy fork code to repo
+      - name: Copy fork code
         run: |
-          rsync -a --delete fork/ .
+          rm -rf fork/.github fork/.git
+          cp -R fork/. .
           rm -rf fork
 
-      - name: Commit and push changes
+      - name: Commit & push
+        id: push-changes
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add .
           git commit -m "Sync fork code from PR #${{ github.event.issue.number }}"
-          git push
+          git push --set-upstream origin ${{ steps.gen-branch.outputs.branch-name }}
         continue-on-error: true
 
-      - name: Close existing pull request
+      - name: Close original PR
+        if: steps.push-changes.outcome == 'success'
         uses: actions/github-script@v7
         with:
           script: |
@@ -78,8 +99,9 @@ jobs:
               state: 'closed'
             });
 
-      - name: Create new pull request
+      - name: Create new PR
         id: new_pr
+        if: steps.push-changes.outcome == 'success'
         uses: actions/github-script@v7
         with:
           script: |
@@ -92,57 +114,49 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               title: `Sync fork code from PR #${context.issue.number}`,
-              head: pr.data.head.ref,
+              head: '${{ steps.gen-branch.outputs.branch-name }}',
               base: pr.data.base.ref,
               body: `Automated sync from fork for PR #${context.issue.number}`,
               maintainer_can_modify: true
             });
             return newPr.data.number;
 
-      - name: Assign initial PR user
+      - name: Assign PR user & reviewers
+        if: steps.push-changes.outcome == 'success'
         uses: actions/github-script@v7
         with:
           script: |
-            const pr = await github.rest.pulls.get({
+            const origPr = await github.rest.pulls.get({
               owner: context.repo.owner,
               repo: context.repo.repo,
               pull_number: context.issue.number
             });
+            const newPrNum = ${{ steps.new_pr.outputs.result }};
             await github.rest.issues.addAssignees({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: ${{ steps.new_pr.outputs.result }},
-              assignees: [pr.data.user.login]
+              issue_number: newPrNum,
+              assignees: [origPr.data.user.login]
             });
-
-      - name: Add reviewers from original PR
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const pr = await github.rest.pulls.get({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: context.issue.number
-            });
-            const reviewers = pr.data.requested_reviewers.map(r => r.login);
-            if (reviewers.length > 0) {
+            const reviewers = origPr.data.requested_reviewers.map(r => r.login);
+            if (reviewers.length)
               await github.rest.pulls.requestReviewers({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                pull_number: ${{ steps.new_pr.outputs.result }},
+                pull_number: newPrNum,
                 reviewers
               });
-            }
 
-      - name: Comment on initial PR with link to new PR
+      - name: Comment with new PR link
+        if: steps.push-changes.outcome == 'success'
         uses: actions/github-script@v7
         with:
           script: |
-            const newPrNumber = ${{ steps.new_pr.outputs.result }};
+            const newPrNum = ${{ steps.new_pr.outputs.result }};
             const { data: newPr } = await github.rest.pulls.get({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              pull_number: newPrNumber
+              pull_number: newPrNum
             });
             await github.rest.issues.createComment({
               owner: context.repo.owner,
